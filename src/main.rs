@@ -1,6 +1,6 @@
 use clap::Parser;
 use input::event::TouchEvent;
-use input::event::touch::TouchEventPosition;
+use input::event::touch::{TouchEventPosition, TouchEventSlot};
 use input::{Event as InputEvent, Libinput, LibinputInterface};
 use rustix::event::{PollFd, PollFlags, poll};
 use std::fs::{File, OpenOptions};
@@ -9,7 +9,6 @@ use std::os::unix::{
     io::{AsFd, OwnedFd},
 };
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -17,17 +16,22 @@ extern crate libc;
 use libc::{O_RDONLY, O_RDWR, O_WRONLY};
 
 use crate::gesture::GestureState;
+use crate::output::get_output_dimensions;
 
 mod config;
 mod gesture;
+mod output;
 
 /// Touch Gesture Daemon
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Size of screen edge zone in pixels
     #[arg(long, short)]
     config: PathBuf,
+
+    /// Increase log verbosity (-v info, -vv debug, -vvv trace)
+    #[arg(short, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 struct Interface;
@@ -51,41 +55,53 @@ impl LibinputInterface for Interface {
 fn main() {
     let args = Args::parse();
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
-        .finish();
+    let log_level = match args.verbose {
+        0 => Level::WARN,
+        1 => Level::INFO,
+        2 => Level::DEBUG,
+        _ => Level::TRACE,
+    };
 
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(log_level)
+        .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
     let mut input = Libinput::new_with_udev(Interface);
     input.udev_assign_seat("seat0").unwrap();
-    let (width, height) = get_output_dimensions().unwrap();
+
+    let (width, height) = get_output_dimensions().unwrap_or_else(|| {
+        tracing::warn!("Could not detect output dimensions, defaulting to 1920x1080");
+        (1920, 1080)
+    });
+    tracing::info!("Using screen dimensions: {}x{}", width, height);
 
     let config = config::GesturesConfig::from_path(&args.config).unwrap();
     let mut state = GestureState::new(config, width as f64, height as f64);
 
     loop {
-        // Wait for events using poll() to avoid busy-waiting
         let poll_fd = PollFd::from_borrowed_fd(input.as_fd(), PollFlags::IN);
-        poll(&mut [poll_fd], -1).unwrap();
+        poll(&mut [poll_fd], None).unwrap();
 
-        // Process events when available
         input.dispatch().unwrap();
         for event in &mut input {
             match event {
                 InputEvent::Touch(TouchEvent::Motion(touch_event)) => {
                     state.update(
+                        touch_event.slot(),
                         touch_event.x_transformed(width),
                         touch_event.y_transformed(height),
                     );
                 }
                 InputEvent::Touch(TouchEvent::Down(touch_event)) => {
-                    state.handle_touch_down(
+                    state.touch_down(
+                        touch_event.slot(),
                         touch_event.x_transformed(width),
                         touch_event.y_transformed(height),
                     );
                 }
-                InputEvent::Touch(TouchEvent::Up(_)) => {
-                    state.handle_touch_up();
+                InputEvent::Touch(TouchEvent::Up(touch_event)) => {
+                    state.touch_up(touch_event.slot());
                 }
                 _ => {}
             }
@@ -93,35 +109,4 @@ fn main() {
     }
 }
 
-fn get_output_dimensions() -> Option<(u32, u32)> {
-    #[derive(serde::Deserialize)]
-    struct OutputData {
-        logical: LogicalDimensions,
-    }
 
-    #[derive(serde::Deserialize)]
-    struct LogicalDimensions {
-        width: u32,
-        height: u32,
-    }
-
-    let output = Command::new("niri")
-        .arg("msg")
-        .arg("-j")
-        .arg("outputs")
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let json_str = String::from_utf8(output.stdout).ok()?;
-    let outputs: std::collections::HashMap<String, OutputData> =
-        serde_json::from_str(&json_str).ok()?;
-
-    outputs
-        .values()
-        .next()
-        .map(|output_data| (output_data.logical.width, output_data.logical.height))
-}
